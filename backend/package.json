@@ -1,0 +1,17 @@
+{
+  "name": "sber-sync-backend",
+  "version": "1.0.0",
+  "description": "Забирает выписку по счёту ИП из Sber API (СберБизнес) и отдаёт её как простой JSON-эндпоинт для фронтенд-инструмента учёта УСН 6%.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "sync-now": "node sync.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.4.5"
+  }
+}

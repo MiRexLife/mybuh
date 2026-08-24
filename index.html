@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Учёт ИП · УСН 6%</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js" crossorigin></script>
+<style>
+  body { margin: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback } = React;
+const Papa = window.Papa;
+
+// ---------- constants (2026 tax year, Russia, ИП без сотрудников, УСН 6%) ----------
+const TAX_RATE = 0.06;
+const FIXED_CONTRIB_2026 = 57390; // фиксированные взносы "за себя" за полный год
+const ADDITIONAL_CONTRIB_CAP_2026 = 321818; // максимум 1% сверх 300 000
+const CONTRIB_THRESHOLD = 300000;
+
+const QUARTERS = [
+  { id: 1, label: "I квартал", months: [0, 1, 2], dueDate: "28 апреля" },
+  { id: 2, label: "II квартал", months: [3, 4, 5], dueDate: "28 июля" },
+  { id: 3, label: "III квартал", months: [6, 7, 8], dueDate: "28 октября" },
+  { id: 4, label: "IV квартал", months: [9, 10, 11], dueDate: "28 апреля (год)" },
+];
+
+const fmt = (n) =>
+  (Math.round(n * 100) / 100).toLocaleString("ru-RU", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+// ---------- storage helpers (localStorage, so this works as a standalone static site) ----------
+const storage = {
+  get: async (key) => {
+    const v = localStorage.getItem(key);
+    return v === null ? null : { value: v };
+  },
+  set: async (key, value) => {
+    try {
+      localStorage.setItem(key, value);
+      return { ok: true };
+    } catch (e) {
+      return null;
+    }
+  },
+};
+
+async function loadState() {
+  const out = { transactions: [], contributions: [], year: 2026, backendUrl: "", backendKey: "" };
+  try {
+    const t = await storage.get("usn:transactions");
+    if (t) out.transactions = JSON.parse(t.value);
+  } catch (e) {}
+  try {
+    const c = await storage.get("usn:contributions");
+    if (c) out.contributions = JSON.parse(c.value);
+  } catch (e) {}
+  try {
+    const y = await storage.get("usn:year");
+    if (y) out.year = JSON.parse(y.value);
+  } catch (e) {}
+  try {
+    const b = await storage.get("usn:backend");
+    if (b) {
+      const parsed = JSON.parse(b.value);
+      out.backendUrl = parsed.url || "";
+      out.backendKey = parsed.key || "";
+    }
+  } catch (e) {}
+  return out;
+}
+
+function App() {
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState("ops");
+  const [year, setYear] = useState(2026);
+  const [transactions, setTransactions] = useState([]);
+  const [contributions, setContributions] = useState([]);
+  const [saveError, setSaveError] = useState("");
+
+  const [csvRows, setCsvRows] = useState(null);
+  const [csvHeaders, setCsvHeaders] = useState([]);
+  const [colMap, setColMap] = useState({ date: "", amount: "", desc: "" });
+  const [csvError, setCsvError] = useState("");
+
+  const [form, setForm] = useState({ date: "", amount: "", desc: "" });
+  const [contribForm, setContribForm] = useState({ date: "", amount: "", type: "fixed" });
+
+  const [backendUrl, setBackendUrl] = useState("");
+  const [backendKey, setBackendKey] = useState("");
+  const [syncStatus, setSyncStatus] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      const s = await loadState();
+      setTransactions(s.transactions);
+      setContributions(s.contributions);
+      setYear(s.year);
+      setBackendUrl(s.backendUrl);
+      setBackendKey(s.backendKey);
+      setLoading(false);
+    })();
+  }, []);
+
+  const persist = useCallback(async (key, value) => {
+    try {
+      const res = await storage.set(key, JSON.stringify(value));
+      if (!res) setSaveError("Не удалось сохранить — попробуйте ещё раз.");
+      else setSaveError("");
+    } catch (e) {
+      setSaveError("Не удалось сохранить — попробуйте ещё раз.");
+    }
+  }, []);
+
+  const saveTransactions = (next) => {
+    setTransactions(next);
+    persist("usn:transactions", next);
+  };
+  const saveContributions = (next) => {
+    setContributions(next);
+    persist("usn:contributions", next);
+  };
+  const saveYear = (y) => {
+    setYear(y);
+    persist("usn:year", y);
+  };
+  const saveBackendSettings = (url, key) => {
+    setBackendUrl(url);
+    setBackendKey(key);
+    persist("usn:backend", { url, key });
+  };
+
+  const syncFromBackend = async () => {
+    if (!backendUrl || !backendKey) {
+      setSyncStatus("Укажите адрес сервера и ключ доступа.");
+      return;
+    }
+    setSyncStatus("Синхронизация…");
+    try {
+      const res = await fetch(`${backendUrl.replace(/\/$/, "")}/api/transactions`, {
+        headers: { Authorization: `Bearer ${backendKey}` },
+      });
+      if (!res.ok) throw new Error(`Сервер ответил ${res.status}`);
+      const data = await res.json();
+      const incoming = (data.transactions || []).map((t) => ({
+        id: `backend-${t.id}`,
+        date: t.date,
+        amount: t.amount,
+        desc: t.desc || "",
+        source: "backend",
+        include: true,
+      }));
+      const existingIds = new Set(transactions.map((t) => t.id));
+      const fresh = incoming.filter((t) => !existingIds.has(t.id));
+      if (fresh.length === 0) {
+        setSyncStatus("Новых операций нет — всё уже синхронизировано.");
+        return;
+      }
+      saveTransactions([...transactions, ...fresh]);
+      setSyncStatus(`Добавлено новых операций: ${fresh.length}.`);
+    } catch (e) {
+      setSyncStatus(`Не удалось синхронизироваться: ${e.message}`);
+    }
+  };
+
+  const onFile = (file) => {
+    setCsvError("");
+    Papa.parse(file, {
+      complete: (res) => {
+        const rows = res.data.filter((r) => r.some((c) => (c || "").trim() !== ""));
+        if (rows.length < 2) {
+          setCsvError("В файле не нашлось строк с данными.");
+          return;
+        }
+        setCsvHeaders(rows[0].map((h, i) => h || `Колонка ${i + 1}`));
+        setCsvRows(rows.slice(1));
+        const lower = rows[0].map((h) => (h || "").toLowerCase());
+        const guess = (words) => {
+          const idx = lower.findIndex((h) => words.some((w) => h.includes(w)));
+          return idx >= 0 ? String(idx) : "";
+        };
+        setColMap({
+          date: guess(["дата"]),
+          amount: guess(["сумма", "приход", "зачисл"]),
+          desc: guess(["назначен", "описан", "коммент"]),
+        });
+      },
+      error: () => setCsvError("Не получилось прочитать файл. Убедитесь, что это CSV."),
+    });
+  };
+
+  const parseAmount = (raw) => {
+    if (raw == null) return NaN;
+    const cleaned = String(raw)
+      .replace(/\s/g, "")
+      .replace(/[^\d,.\-]/g, "")
+      .replace(",", ".");
+    return parseFloat(cleaned);
+  };
+
+  const parseDate = (raw) => {
+    if (!raw) return null;
+    const s = String(raw).trim();
+    let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+    if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+    m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+    if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+    const d = new Date(s);
+    if (!isNaN(d)) return d.toISOString().slice(0, 10);
+    return null;
+  };
+
+  const importCsv = () => {
+    if (!colMap.date || !colMap.amount) {
+      setCsvError("Укажите, какая колонка — дата и какая — сумма.");
+      return;
+    }
+    const di = Number(colMap.date);
+    const ai = Number(colMap.amount);
+    const desci = colMap.desc === "" ? -1 : Number(colMap.desc);
+    const next = [];
+    for (const row of csvRows) {
+      const date = parseDate(row[di]);
+      const amount = parseAmount(row[ai]);
+      if (!date || isNaN(amount) || amount <= 0) continue;
+      next.push({
+        id: uid(),
+        date,
+        amount,
+        desc: desci >= 0 ? row[desci] || "" : "",
+        source: "csv",
+        include: true,
+      });
+    }
+    if (next.length === 0) {
+      setCsvError("Не нашлось ни одной строки с положительной суммой поступления.");
+      return;
+    }
+    saveTransactions([...transactions, ...next]);
+    setCsvRows(null);
+    setCsvHeaders([]);
+    setColMap({ date: "", amount: "", desc: "" });
+  };
+
+  const addManual = () => {
+    const amount = parseAmount(form.amount);
+    if (!form.date || isNaN(amount) || amount <= 0) return;
+    saveTransactions([
+      ...transactions,
+      { id: uid(), date: form.date, amount, desc: form.desc, source: "manual", include: true },
+    ]);
+    setForm({ date: "", amount: "", desc: "" });
+  };
+
+  const addContribution = () => {
+    const amount = parseAmount(contribForm.amount);
+    if (!contribForm.date || isNaN(amount) || amount <= 0) return;
+    saveContributions([
+      ...contributions,
+      { id: uid(), date: contribForm.date, amount, type: contribForm.type },
+    ]);
+    setContribForm({ date: "", amount: "", type: "fixed" });
+  };
+
+  const toggleInclude = (id) => {
+    saveTransactions(transactions.map((t) => (t.id === id ? { ...t, include: !t.include } : t)));
+  };
+  const removeTx = (id) => saveTransactions(transactions.filter((t) => t.id !== id));
+  const removeContrib = (id) => saveContributions(contributions.filter((c) => c.id !== id));
+
+  const yearTx = useMemo(
+    () => transactions.filter((t) => t.include && new Date(t.date).getFullYear() === year),
+    [transactions, year]
+  );
+  const yearContrib = useMemo(
+    () => contributions.filter((c) => new Date(c.date).getFullYear() === year),
+    [contributions, year]
+  );
+  const totalIncome = yearTx.reduce((s, t) => s + t.amount, 0);
+
+  const quarterStats = useMemo(() => {
+    let cumIncome = 0;
+    let cumContrib = 0;
+    let cumPaidAdvance = 0;
+    return QUARTERS.map((q) => {
+      const qIncome = yearTx
+        .filter((t) => q.months.includes(new Date(t.date).getMonth()))
+        .reduce((s, t) => s + t.amount, 0);
+      cumIncome += qIncome;
+      const qContrib = yearContrib
+        .filter((c) => q.months.includes(new Date(c.date).getMonth()))
+        .reduce((s, c) => s + c.amount, 0);
+      cumContrib += qContrib;
+      const cumTax = cumIncome * TAX_RATE;
+      const owedSoFar = Math.max(0, cumTax - cumContrib);
+      const dueThisQuarter = Math.max(0, owedSoFar - cumPaidAdvance);
+      cumPaidAdvance += dueThisQuarter;
+      return { ...q, qIncome, cumIncome, cumTax, cumContrib, dueThisQuarter };
+    });
+  }, [yearTx, yearContrib]);
+
+  const additionalContribDue = Math.min(
+    Math.max(0, (totalIncome - CONTRIB_THRESHOLD) * 0.01),
+    ADDITIONAL_CONTRIB_CAP_2026
+  );
+  const fixedPaid = yearContrib.filter((c) => c.type === "fixed").reduce((s, c) => s + c.amount, 0);
+  const additionalPaid = yearContrib
+    .filter((c) => c.type === "additional")
+    .reduce((s, c) => s + c.amount, 0);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: "#FFFFFF", color: "#69706B" }}>
+        Загрузка…
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen" style={{ background: "#FFFFFF", color: "#1A1E1B", fontFamily: "'IBM Plex Sans', system-ui, sans-serif" }}>
+      <div className="max-w-3xl mx-auto px-4 py-6">
+        <header className="mb-6">
+          <div className="flex items-baseline justify-between">
+            <h1 className="text-xl font-semibold tracking-tight">Учёт ИП · УСН 6%</h1>
+            <select
+              value={year}
+              onChange={(e) => saveYear(Number(e.target.value))}
+              className="bg-transparent border rounded px-2 py-1 text-sm"
+              style={{ borderColor: "#D7DCD3", color: "#1A1E1B" }}
+            >
+              {[2025, 2026, 2027].map((y) => (
+                <option key={y} value={y} style={{ color: "#000" }}>
+                  {y}
+                </option>
+              ))}
+            </select>
+          </div>
+          <p className="text-sm mt-1" style={{ color: "#69706B" }}>
+            Без сотрудников · взносы уменьшают налог до 100%
+          </p>
+        </header>
+
+        <nav className="flex gap-1 mb-6 text-sm" style={{ borderBottom: "1px solid #D7DCD3" }}>
+          {[
+            ["ops", "Операции"],
+            ["summary", "Налог"],
+            ["contrib", "Взносы"],
+            ["api", "Про API"],
+          ].map(([id, label]) => (
+            <button
+              key={id}
+              onClick={() => setTab(id)}
+              className="px-3 py-2 -mb-px"
+              style={{
+                borderBottom: tab === id ? "2px solid #21A038" : "2px solid transparent",
+                color: tab === id ? "#1A1E1B" : "#69706B",
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+
+        {saveError && (
+          <div className="mb-4 text-sm px-3 py-2 rounded" style={{ background: "#FBE9E7", color: "#C0392B" }}>
+            {saveError}
+          </div>
+        )}
+
+        {tab === "ops" && (
+          <div className="space-y-6">
+            <section className="rounded-lg p-4" style={{ background: "#F2F5F0" }}>
+              <h2 className="font-medium mb-2">Загрузить выписку (CSV)</h2>
+              <p className="text-sm mb-3" style={{ color: "#69706B" }}>
+                Выгрузите выписку по счёту из СберБизнес в формате CSV и загрузите её сюда. Учитываются
+                только поступления (положительные суммы) — переводы себе, возвраты и внутренние операции
+                можно потом исключить вручную.
+              </p>
+              {!csvRows && (
+                <input
+                  type="file"
+                  accept=".csv,text/csv"
+                  onChange={(e) => e.target.files[0] && onFile(e.target.files[0])}
+                  className="text-sm"
+                />
+              )}
+              {csvError && (
+                <p className="text-sm mt-2" style={{ color: "#C0392B" }}>
+                  {csvError}
+                </p>
+              )}
+              {csvRows && (
+                <div className="mt-3 space-y-3">
+                  <p className="text-sm" style={{ color: "#69706B" }}>
+                    Нашли {csvRows.length} строк. Укажите, какие колонки за что отвечают:
+                  </p>
+                  <div className="grid grid-cols-3 gap-2 text-sm">
+                    {["date", "amount", "desc"].map((field) => (
+                      <div key={field}>
+                        <label className="block mb-1" style={{ color: "#69706B" }}>
+                          {field === "date" ? "Дата" : field === "amount" ? "Сумма" : "Описание"}
+                        </label>
+                        <select
+                          value={colMap[field]}
+                          onChange={(e) => setColMap({ ...colMap, [field]: e.target.value })}
+                          className="w-full bg-transparent border rounded px-2 py-1"
+                          style={{ borderColor: "#D7DCD3" }}
+                        >
+                          <option value="" style={{ color: "#000" }}>
+                            —
+                          </option>
+                          {csvHeaders.map((h, i) => (
+                            <option key={i} value={i} style={{ color: "#000" }}>
+                              {h}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={importCsv}
+                      className="px-3 py-1.5 rounded text-sm font-medium"
+                      style={{ background: "#21A038", color: "#FFFFFF" }}
+                    >
+                      Импортировать
+                    </button>
+                    <button
+                      onClick={() => {
+                        setCsvRows(null);
+                        setCsvHeaders([]);
+                        setCsvError("");
+                      }}
+                      className="px-3 py-1.5 rounded text-sm"
+                      style={{ color: "#69706B" }}
+                    >
+                      Отмена
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
+
+            <section className="rounded-lg p-4" style={{ background: "#F2F5F0" }}>
+              <h2 className="font-medium mb-2">Добавить операцию вручную</h2>
+              <div className="grid grid-cols-3 gap-2 text-sm mb-2">
+                <input
+                  type="date"
+                  value={form.date}
+                  onChange={(e) => setForm({ ...form, date: e.target.value })}
+                  className="bg-transparent border rounded px-2 py-1"
+                  style={{ borderColor: "#D7DCD3" }}
+                />
+                <input
+                  type="text"
+                  placeholder="Сумма, ₽"
+                  value={form.amount}
+                  onChange={(e) => setForm({ ...form, amount: e.target.value })}
+                  className="bg-transparent border rounded px-2 py-1"
+                  style={{ borderColor: "#D7DCD3" }}
+                />
+                <input
+                  type="text"
+                  placeholder="Описание"
+                  value={form.desc}
+                  onChange={(e) => setForm({ ...form, desc: e.target.value })}
+                  className="bg-transparent border rounded px-2 py-1"
+                  style={{ borderColor: "#D7DCD3" }}
+                />
+              </div>
+              <button
+                onClick={addManual}
+                className="px-3 py-1.5 rounded text-sm font-medium"
+                style={{ background: "#21A038", color: "#FFFFFF" }}
+              >
+                Добавить
+              </button>
+            </section>
+
+            <section className="rounded-lg p-4" style={{ background: "#F2F5F0" }}>
+              <h2 className="font-medium mb-3">
+                Поступления за {year} год ({yearTx.length})
+              </h2>
+              {transactions.filter((t) => new Date(t.date).getFullYear() === year).length === 0 ? (
+                <p className="text-sm" style={{ color: "#69706B" }}>
+                  Пока нет операций. Загрузите выписку или добавьте вручную.
+                </p>
+              ) : (
+                <div className="space-y-1 text-sm" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+                  {transactions
+                    .filter((t) => new Date(t.date).getFullYear() === year)
+                    .sort((a, b) => a.date.localeCompare(b.date))
+                    .map((t) => (
+                      <div
+                        key={t.id}
+                        className="flex items-center gap-2 py-1"
+                        style={{ borderBottom: "1px solid #E3E7DF", opacity: t.include ? 1 : 0.4 }}
+                      >
+                        <input type="checkbox" checked={t.include} onChange={() => toggleInclude(t.id)} />
+                        <span style={{ color: "#69706B", width: 90 }}>{t.date}</span>
+                        <span className="flex-1 truncate" style={{ fontFamily: "inherit" }}>
+                          {t.desc || "—"}
+                        </span>
+                        <span>{fmt(t.amount)} ₽</span>
+                        <button onClick={() => removeTx(t.id)} style={{ color: "#C0392B" }}>
+                          ✕
+                        </button>
+                      </div>
+                    ))}
+                </div>
+              )}
+              <p className="text-xs mt-3" style={{ color: "#69706B" }}>
+                Снимите галочку у операций, которые не являются доходом (переводы себе, возвраты).
+              </p>
+            </section>
+          </div>
+        )}
+
+        {tab === "summary" && (
+          <div className="space-y-4">
+            <section className="rounded-lg p-4" style={{ background: "#F2F5F0" }}>
+              <div className="flex justify-between text-sm mb-1">
+                <span style={{ color: "#69706B" }}>Доход за {year} год</span>
+                <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(totalIncome)} ₽</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span style={{ color: "#69706B" }}>Налог по ставке 6% (до вычета взносов)</span>
+                <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(totalIncome * TAX_RATE)} ₽</span>
+              </div>
+            </section>
+
+            {quarterStats.map((q) => (
+              <section key={q.id} className="rounded-lg p-4" style={{ background: "#F2F5F0" }}>
+                <div className="flex items-baseline justify-between mb-2">
+                  <h3 className="font-medium">{q.label}</h3>
+                  <span className="text-xs" style={{ color: "#69706B" }}>
+                    срок: {q.dueDate}
+                  </span>
+                </div>
+                <div className="text-sm space-y-1" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+                  <div className="flex justify-between">
+                    <span style={{ color: "#69706B", fontFamily: "'IBM Plex Sans', sans-serif" }}>Доход за квартал</span>
+                    <span>{fmt(q.qIncome)} ₽</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span style={{ color: "#69706B", fontFamily: "'IBM Plex Sans', sans-serif" }}>Доход нарастающим итогом</span>
+                    <span>{fmt(q.cumIncome)} ₽</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span style={{ color: "#69706B", fontFamily: "'IBM Plex Sans', sans-serif" }}>Взносы уплачены (с начала года)</span>
+                    <span>{fmt(q.cumContrib)} ₽</span>
+                  </div>
+                  <div
+                    className="flex justify-between pt-2 mt-1 font-medium"
+                    style={{ borderTop: "1px solid #E3E7DF", color: "#21A038" }}
+                  >
+                    <span style={{ fontFamily: "'IBM Plex Sans', sans-serif" }}>К доплате за квартал</span>
+                    <span>{fmt(q.dueThisQuarter)} ₽</span>
+                  </div>
+                </div>
+              </section>
+            ))}
+
+            <section className="rounded-lg p-4 text-sm" style={{ background: "#F2F5F0", color: "#69706B" }}>
+              Декларация УСН за {year} год подаётся до 25 апреля {year + 1} года. Итоговый налог
+              (за вычетом уплаченных авансов) — до 28 апреля {year + 1} года.
+            </section>
+          </div>
+        )}
+
+        {tab === "contrib" && (
+          <div className="space-y-4">
+            <section className="rounded-lg p-4" style={{ background: "#F2F5F0" }}>
+              <h2 className="font-medium mb-2">Фиксированные взносы «за себя» на {year} год</h2>
+              <div className="text-sm space-y-1" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+                <div className="flex justify-between">
+                  <span style={{ color: "#69706B", fontFamily: "'IBM Plex Sans', sans-serif" }}>Начислено (фикс. часть)</span>
+                  <span>{fmt(FIXED_CONTRIB_2026)} ₽</span>
+                </div>
+                <div className="flex justify-between">
+                  <span style={{ color: "#69706B", fontFamily: "'IBM Plex Sans', sans-serif" }}>Уплачено</span>
+                  <span>{fmt(fixedPaid)} ₽</span>
+                </div>
+                <div className="flex justify-between">
+                  <span style={{ color: "#69706B", fontFamily: "'IBM Plex Sans', sans-serif" }}>1% с дохода свыше 300 000 ₽ (начислено)</span>
+                  <span>{fmt(additionalContribDue)} ₽</span>
+                </div>
+                <div className="flex justify-between">
+                  <span style={{ color: "#69706B", fontFamily: "'IBM Plex Sans', sans-serif" }}>Уплачено (доп. взнос)</span>
+                  <span>{fmt(additionalPaid)} ₽</span>
+                </div>
+              </div>
+              <p className="text-xs mt-3" style={{ color: "#69706B" }}>
+                Срок уплаты фиксированной части — 28 декабря {year} года. Срок уплаты 1% с превышения —
+                1 июля {year + 1} года. Суммы актуальны для 2026 года; для другого года сверьте с ФНС.
+              </p>
+            </section>
+
+            <section className="rounded-lg p-4" style={{ background: "#F2F5F0" }}>
+              <h2 className="font-medium mb-2">Записать платёж взноса</h2>
+              <div className="grid grid-cols-3 gap-2 text-sm mb-2">
+                <input
+                  type="date"
+                  value={contribForm.date}
+                  onChange={(e) => setContribForm({ ...contribForm, date: e.target.value })}
+                  className="bg-transparent border rounded px-2 py-1"
+                  style={{ borderColor: "#D7DCD3" }}
+                />
+                <input
+                  type="text"
+                  placeholder="Сумма, ₽"
+                  value={contribForm.amount}
+                  onChange={(e) => setContribForm({ ...contribForm, amount: e.target.value })}
+                  className="bg-transparent border rounded px-2 py-1"
+                  style={{ borderColor: "#D7DCD3" }}
+                />
+                <select
+                  value={contribForm.type}
+                  onChange={(e) => setContribForm({ ...contribForm, type: e.target.value })}
+                  className="bg-transparent border rounded px-2 py-1"
+                  style={{ borderColor: "#D7DCD3" }}
+                >
+                  <option value="fixed" style={{ color: "#000" }}>
+                    Фиксированный
+                  </option>
+                  <option value="additional" style={{ color: "#000" }}>
+                    1% с превышения
+                  </option>
+                </select>
+              </div>
+              <button
+                onClick={addContribution}
+                className="px-3 py-1.5 rounded text-sm font-medium"
+                style={{ background: "#21A038", color: "#FFFFFF" }}
+              >
+                Добавить
+              </button>
+            </section>
+
+            <section className="rounded-lg p-4" style={{ background: "#F2F5F0" }}>
+              <h2 className="font-medium mb-3">История платежей</h2>
+              {yearContrib.length === 0 ? (
+                <p className="text-sm" style={{ color: "#69706B" }}>
+                  Пока нет записей.
+                </p>
+              ) : (
+                <div className="space-y-1 text-sm" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+                  {yearContrib
+                    .sort((a, b) => a.date.localeCompare(b.date))
+                    .map((c) => (
+                      <div key={c.id} className="flex items-center gap-2 py-1" style={{ borderBottom: "1px solid #E3E7DF" }}>
+                        <span style={{ color: "#69706B", width: 90 }}>{c.date}</span>
+                        <span className="flex-1" style={{ fontFamily: "'IBM Plex Sans', sans-serif" }}>
+                          {c.type === "fixed" ? "Фиксированный" : "1% с превышения"}
+                        </span>
+                        <span>{fmt(c.amount)} ₽</span>
+                        <button onClick={() => removeContrib(c.id)} style={{ color: "#C0392B" }}>
+                          ✕
+                        </button>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+
+        {tab === "api" && (
+          <React.Fragment>
+            <section className="rounded-lg p-4 text-sm space-y-3" style={{ background: "#F2F5F0", color: "#2C332D" }}>
+              <h2 className="font-medium" style={{ color: "#1A1E1B" }}>
+                Почему выписка СберБизнес не подтягивается автоматически прямо здесь
+              </h2>
+              <p>
+                У СберБизнес есть API для выписок и платежей, но доступ к нему выдаётся через регистрацию
+                приложения и требует client_id/client_secret и токен, привязанный к организации. Эти секреты
+                нельзя безопасно хранить в браузерном коде — любой, кто откроет эту страницу, увидит их в
+                исходниках. Поэтому прямой вызов банковского API нужно делать не отсюда, а с отдельного
+                сервера, который вы контролируете (см. папку backend/ в этом репозитории).
+              </p>
+              <p>Рабочая схема для автоматизации:</p>
+              <ol className="list-decimal pl-5 space-y-1">
+                <li>Небольшой backend (Node.js/Python), который хранит секреты СберБизнес и раз в день дергает API за выписками.</li>
+                <li>Backend кладёт новые операции в базу или отдаёт их через свой API.</li>
+                <li>Этот интерфейс просто читает уже готовые данные — без прямого обращения к банку из браузера.</li>
+              </ol>
+              <p>
+                Пока backend не развёрнут, ручная выгрузка CSV из СберБизнес раз в неделю или перед кварталом
+                полностью закрывает задачу и ничем не уступает по точности.
+              </p>
+            </section>
+
+            <section className="rounded-lg p-4 text-sm space-y-3 mt-4" style={{ background: "#F2F5F0" }}>
+              <h2 className="font-medium" style={{ color: "#1A1E1B" }}>
+                Подключить свой sber-sync-backend
+              </h2>
+              <p style={{ color: "#69706B" }}>
+                Если сервер уже развёрнут и вы один раз авторизовались через /auth, укажите его адрес и ключ
+                доступа — инструмент будет подтягивать новые поступления по кнопке.
+              </p>
+              <div className="grid grid-cols-1 gap-2">
+                <input
+                  type="text"
+                  placeholder="https://ваш-сервер.example"
+                  value={backendUrl}
+                  onChange={(e) => saveBackendSettings(e.target.value, backendKey)}
+                  className="bg-transparent border rounded px-2 py-1"
+                  style={{ borderColor: "#D7DCD3" }}
+                />
+                <input
+                  type="password"
+                  placeholder="LOCAL_API_KEY"
+                  value={backendKey}
+                  onChange={(e) => saveBackendSettings(backendUrl, e.target.value)}
+                  className="bg-transparent border rounded px-2 py-1"
+                  style={{ borderColor: "#D7DCD3" }}
+                />
+              </div>
+              <button
+                onClick={syncFromBackend}
+                className="px-3 py-1.5 rounded text-sm font-medium"
+                style={{ background: "#21A038", color: "#FFFFFF" }}
+              >
+                Синхронизировать сейчас
+              </button>
+              {syncStatus && (
+                <p className="text-sm" style={{ color: "#69706B" }}>
+                  {syncStatus}
+                </p>
+              )}
+            </section>
+          </React.Fragment>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
