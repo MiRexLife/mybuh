@@ -9,6 +9,14 @@
 <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.5/babel.min.js" crossorigin></script>
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js" crossorigin></script>
+<script>
+  if (window.pdfjsLib) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+  }
+</script>
 <style>
   body { margin: 0; font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
 </style>
@@ -75,7 +83,7 @@ const storage = {
 };
 
 async function loadState() {
-  const out = { transactions: [], contributions: [], year: 2026, backendUrl: "", backendKey: "" };
+  const out = { transactions: [], contributions: [], year: 2026, backendUrl: "", backendKey: "", myAccount: "" };
   try {
     const t = await storage.get("usn:transactions");
     if (t) out.transactions = JSON.parse(t.value);
@@ -96,6 +104,10 @@ async function loadState() {
       out.backendKey = parsed.key || "";
     }
   } catch (e) {}
+  try {
+    const a = await storage.get("usn:myAccount");
+    if (a) out.myAccount = JSON.parse(a.value);
+  } catch (e) {}
   return out;
 }
 
@@ -112,6 +124,12 @@ function App() {
   const [colMap, setColMap] = useState({ date: "", amount: "", desc: "" });
   const [csvError, setCsvError] = useState("");
 
+  // предварительный просмотр для форматов 1С и PDF, где колонки не нужно указывать вручную
+  const [pending, setPending] = useState(null); // [{id, date, amount, desc, include}]
+  const [pendingLabel, setPendingLabel] = useState("");
+  const [myAccount, setMyAccount] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
+
   const [form, setForm] = useState({ date: "", amount: "", desc: "" });
   const [contribForm, setContribForm] = useState({ date: "", amount: "", type: "fixed" });
 
@@ -127,6 +145,7 @@ function App() {
       setYear(s.year);
       setBackendUrl(s.backendUrl);
       setBackendKey(s.backendKey);
+      setMyAccount(s.myAccount);
       setLoading(false);
     })();
   }, []);
@@ -157,6 +176,10 @@ function App() {
     setBackendUrl(url);
     setBackendKey(key);
     persist("usn:backend", { url, key });
+  };
+  const saveMyAccount = (acc) => {
+    setMyAccount(acc);
+    persist("usn:myAccount", acc);
   };
 
   const syncFromBackend = async () => {
@@ -192,8 +215,53 @@ function App() {
     }
   };
 
-  const onFile = (file) => {
+  const onFile = async (file) => {
     setCsvError("");
+    setPending(null);
+    const name = file.name.toLowerCase();
+    try {
+      if (name.endsWith(".pdf")) {
+        setImportBusy(true);
+        const rows = await parsePdfFile(file);
+        setImportBusy(false);
+        if (rows.length === 0) {
+          setCsvError(
+            "Не удалось распознать операции в PDF. Формат выписки может отличаться — попробуйте CSV или Excel из СберБизнес."
+          );
+          return;
+        }
+        setPending(rows);
+        setPendingLabel(`PDF: найдено ${rows.length} операций (проверьте перед импортом)`);
+        return;
+      }
+      if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
+        parseXlsxFile(file);
+        return;
+      }
+      // .txt может оказаться форматом обмена 1С — проверяем по содержимому
+      if (name.endsWith(".txt")) {
+        const buf = await file.arrayBuffer();
+        const head = new TextDecoder("utf-8", { fatal: false }).decode(buf.slice(0, 200));
+        if (head.includes("1CClientBankExchange")) {
+          const rows = parse1C(buf);
+          if (rows.length === 0) {
+            setCsvError("В файле формата 1С не нашлось документов с суммой и датой.");
+            return;
+          }
+          setPending(rows);
+          setPendingLabel(`1С: найдено ${rows.length} операций (проверьте перед импортом)`);
+          return;
+        }
+      }
+      // по умолчанию — CSV
+      parseCsvFile(file);
+    } catch (e) {
+      setImportBusy(false);
+      setCsvError(`Не получилось прочитать файл: ${e.message}`);
+    }
+  };
+
+  const parseCsvFile = (file) => {
     Papa.parse(file, {
       complete: (res) => {
         const rows = res.data.filter((r) => r.some((c) => (c || "").trim() !== ""));
@@ -216,6 +284,130 @@ function App() {
       },
       error: () => setCsvError("Не получилось прочитать файл. Убедитесь, что это CSV."),
     });
+  };
+
+  const parseXlsxFile = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: "array" });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils
+          .sheet_to_json(sheet, { header: 1, raw: false, defval: "" })
+          .filter((r) => r.some((c) => String(c || "").trim() !== ""));
+        if (rows.length < 2) {
+          setCsvError("В файле Excel не нашлось строк с данными.");
+          return;
+        }
+        setCsvHeaders(rows[0].map((h, i) => h || `Колонка ${i + 1}`));
+        setCsvRows(rows.slice(1));
+        const lower = rows[0].map((h) => String(h || "").toLowerCase());
+        const guess = (words) => {
+          const idx = lower.findIndex((h) => words.some((w) => h.includes(w)));
+          return idx >= 0 ? String(idx) : "";
+        };
+        setColMap({
+          date: guess(["дата"]),
+          amount: guess(["сумма", "приход", "зачисл"]),
+          desc: guess(["назначен", "описан", "коммент"]),
+        });
+      } catch (err) {
+        setCsvError(`Не получилось прочитать Excel-файл: ${err.message}`);
+      }
+    };
+    reader.onerror = () => setCsvError("Не получилось прочитать Excel-файл.");
+    reader.readAsArrayBuffer(file);
+  };
+
+  // Формат обмена "1CClientBankExchange" — обычный текст с секциями Ключ=Значение.
+  // Часто в кодировке Windows-1251, поэтому декодируем по указанной в файле кодировке.
+  const parse1C = (buf) => {
+    let text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+    const encMatch = text.match(/Кодировка=(\S+)/i);
+    let enc = "windows-1251";
+    if (encMatch) {
+      const v = encMatch[1].toLowerCase();
+      if (v.includes("utf")) enc = "utf-8";
+      else if (v.includes("dos") || v.includes("866")) enc = "ibm866";
+    }
+    if (enc !== "utf-8") {
+      try {
+        text = new TextDecoder(enc, { fatal: false }).decode(buf);
+      } catch (e) {}
+    }
+    const lines = text.split(/\r?\n/);
+    const docs = [];
+    let cur = null;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("СекцияДокумент=")) {
+        cur = {};
+        continue;
+      }
+      if (trimmed === "КонецДокумента") {
+        if (cur) docs.push(cur);
+        cur = null;
+        continue;
+      }
+      if (!cur) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq === -1) continue;
+      const key = trimmed.slice(0, eq);
+      const value = trimmed.slice(eq + 1);
+      cur[key] = value;
+    }
+    const acc = myAccount.trim();
+    const rows = [];
+    for (const d of docs) {
+      const date = parseDate(d["Дата"]);
+      const amount = parseAmount(d["Сумма"]);
+      if (!date || isNaN(amount) || amount <= 0) continue;
+      // если указан свой счёт — оставляем только поступления на него
+      if (acc && d["ПолучательСчет"] && d["ПолучательСчет"].trim() !== acc) continue;
+      const desc =
+        d["НазначениеПлатежа"] || d["Плательщик"] || d["Получатель"] || "";
+      rows.push({ id: uid(), date, amount, desc, include: true });
+    }
+    return rows;
+  };
+
+  // Грубое извлечение операций из PDF: вытаскиваем текст постранично и ищем строки
+  // вида "дата ... сумма". Формат выписок отличается у разных банков, поэтому
+  // результат нужно проверить перед импортом (для этого и служит окно предпросмотра).
+  const parsePdfFile = async (file) => {
+    if (!window.pdfjsLib) throw new Error("Библиотека для чтения PDF не загрузилась");
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    const lines = [];
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      let cur = "";
+      for (const item of content.items) {
+        cur += item.str;
+        if (item.hasEOL) {
+          lines.push(cur);
+          cur = "";
+        } else {
+          cur += " ";
+        }
+      }
+      if (cur.trim()) lines.push(cur);
+    }
+    const dateRe = /(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})/;
+    const amountRe = /(\d[\d\s]*[.,]\d{2})(?!.*\d[\d\s]*[.,]\d{2})/; // последняя сумма в строке
+    const rows = [];
+    for (const line of lines) {
+      const dm = line.match(dateRe);
+      const am = line.match(amountRe);
+      if (!dm || !am) continue;
+      const date = parseDate(dm[1]);
+      const amount = parseAmount(am[1]);
+      if (!date || isNaN(amount) || amount <= 0) continue;
+      const desc = line.replace(dm[1], "").replace(am[1], "").trim().slice(0, 120);
+      rows.push({ id: uid(), date, amount, desc, include: true });
+    }
+    return rows;
   };
 
   const parseAmount = (raw) => {
@@ -269,6 +461,24 @@ function App() {
     setCsvRows(null);
     setCsvHeaders([]);
     setColMap({ date: "", amount: "", desc: "" });
+  };
+
+  const togglePending = (id) => {
+    setPending(pending.map((r) => (r.id === id ? { ...r, include: !r.include } : r)));
+  };
+
+  const confirmPending = () => {
+    const chosen = pending
+      .filter((r) => r.include)
+      .map((r) => ({ id: r.id, date: r.date, amount: r.amount, desc: r.desc, source: "import", include: true }));
+    if (chosen.length > 0) saveTransactions([...transactions, ...chosen]);
+    setPending(null);
+    setPendingLabel("");
+  };
+
+  const cancelPending = () => {
+    setPending(null);
+    setPendingLabel("");
   };
 
   const addManual = () => {
@@ -399,24 +609,78 @@ function App() {
         {tab === "ops" && (
           <div className="space-y-6">
             <section className="rounded-lg p-4" style={{ background: "#F2F5F0" }}>
-              <h2 className="font-medium mb-2">Загрузить выписку (CSV)</h2>
+              <h2 className="font-medium mb-2">Загрузить выписку</h2>
               <p className="text-sm mb-3" style={{ color: "#69706B" }}>
-                Выгрузите выписку по счёту из СберБизнес в формате CSV и загрузите её сюда. Учитываются
-                только поступления (положительные суммы) — переводы себе, возвраты и внутренние операции
-                можно потом исключить вручную.
+                Поддерживаются форматы: CSV, Excel (xls/xlsx), обмен с 1С (текстовый файл вида
+                «1CClientBankExchange») и PDF-выписка. Учитываются только поступления — переводы себе,
+                возвраты и лишние строки можно исключить перед импортом или потом галочкой в списке.
               </p>
-              {!csvRows && (
+              <div className="mb-3">
+                <label className="block text-sm mb-1" style={{ color: "#69706B" }}>
+                  Ваш расчётный счёт (необязательно, только для формата 1С — отфильтрует чужие исходящие платежи)
+                </label>
+                <input
+                  type="text"
+                  placeholder="40802..."
+                  value={myAccount}
+                  onChange={(e) => saveMyAccount(e.target.value)}
+                  className="bg-transparent border rounded px-2 py-1 text-sm w-full max-w-xs"
+                  style={{ borderColor: "#D7DCD3" }}
+                />
+              </div>
+              {!csvRows && !pending && !importBusy && (
                 <input
                   type="file"
-                  accept=".csv,text/csv"
+                  accept=".csv,.txt,.xls,.xlsx,.pdf,text/csv,application/pdf,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                   onChange={(e) => e.target.files[0] && onFile(e.target.files[0])}
                   className="text-sm"
                 />
+              )}
+              {importBusy && (
+                <p className="text-sm" style={{ color: "#69706B" }}>
+                  Читаю PDF, это может занять несколько секунд…
+                </p>
               )}
               {csvError && (
                 <p className="text-sm mt-2" style={{ color: "#C0392B" }}>
                   {csvError}
                 </p>
+              )}
+              {pending && (
+                <div className="mt-3 space-y-3">
+                  <p className="text-sm" style={{ color: "#69706B" }}>
+                    {pendingLabel}. Снимите галочки с лишнего перед импортом:
+                  </p>
+                  <div
+                    className="space-y-1 text-sm max-h-64 overflow-y-auto"
+                    style={{ fontFamily: "'IBM Plex Mono', monospace" }}
+                  >
+                    {pending.map((r) => (
+                      <div
+                        key={r.id}
+                        className="flex items-center gap-2 py-1"
+                        style={{ borderBottom: "1px solid #E3E7DF", opacity: r.include ? 1 : 0.4 }}
+                      >
+                        <input type="checkbox" checked={r.include} onChange={() => togglePending(r.id)} />
+                        <span style={{ color: "#69706B", width: 90 }}>{r.date}</span>
+                        <span className="flex-1 truncate">{r.desc || "—"}</span>
+                        <span>{fmt(r.amount)} ₽</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={confirmPending}
+                      className="px-3 py-1.5 rounded text-sm font-medium"
+                      style={{ background: "#21A038", color: "#FFFFFF" }}
+                    >
+                      Импортировать выбранные ({pending.filter((r) => r.include).length})
+                    </button>
+                    <button onClick={cancelPending} className="px-3 py-1.5 rounded text-sm" style={{ color: "#69706B" }}>
+                      Отмена
+                    </button>
+                  </div>
+                </div>
               )}
               {csvRows && (
                 <div className="mt-3 space-y-3">
