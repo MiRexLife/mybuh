@@ -4,19 +4,34 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Учёт ИП · УСН 6%</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
-<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.25.6/babel.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js" crossorigin></script>
 <style>
-  body { margin: 0; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
 </style>
 </head>
 <body>
 <div id="root"></div>
+<script>
+  // Если что-то из библиотек не загрузилось или в коде ошибка — показать это
+  // прямо на странице, а не оставлять белый экран.
+  window.addEventListener("error", function (e) {
+    var root = document.getElementById("root");
+    if (root && !root.hasChildNodes()) {
+      root.innerHTML =
+        '<div style="max-width:600px;margin:60px auto;padding:20px;' +
+        'font-family:system-ui,sans-serif;color:#C0392B;background:#FBE9E7;' +
+        'border-radius:8px;">' +
+        '<b>Не удалось загрузить страницу</b><br><br>' +
+        (e.message || "Неизвестная ошибка") +
+        '<br><br><span style="color:#69706B;font-size:13px;">Попробуйте обновить страницу ' +
+        '(Ctrl/Cmd+Shift+R) или проверьте интернет-соединение.</span></div>';
+    }
+  });
+</script>
 
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useCallback } = React;
